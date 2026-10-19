@@ -1,0 +1,1335 @@
+{
+  "name": "My Urbankicks workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "minute": 1
+            }
+          ]
+        },
+        "filters": {}
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -6208,
+        -1168
+      ],
+      "id": "b67fef03-3028-4e80-b25d-2d6f85774318",
+      "name": "Gmail Trigger",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "em1fM0BT3E4AgVlG",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ===========================================\n// NODE 1: PARSE MESSAGES\n// Parses Gmail and Facebook messages into unified format\n// Detects media (audio, video, image) for Gemini processing\n// ===========================================\n\nconst item = $json;\n\n// Get the body (webhook format) or use item directly\nconst body = item.body || item;\n\n// Default values\nlet sourceChannel = 'unknown';\nlet messageContent = '';\nlet customerEmail = '';\nlet customerName = '';\nlet senderId = '';\nlet subject = '';\nlet hasMedia = false;\nlet mediaType = 'text';\nlet mediaUrl = null;\nlet mediaAttachments = [];\n\n// Reply IDs\nlet gmailMessageId = null;\nlet gmailThreadId = null;\nlet fbSenderId = null;\n\n// ===========================================\n// FACEBOOK FORMAT\n// ===========================================\nif (body.object === 'page' && body.entry) {\n  sourceChannel = 'facebook';\n  \n  const entry = body.entry[0];\n  const messaging = entry?.messaging?.[0];\n  \n  if (messaging) {\n    senderId = messaging.sender?.id || '';\n    messageContent = messaging.message?.text || '';\n    customerEmail = senderId + '@facebook.com';\n    customerName = 'Facebook User ' + senderId;\n    \n    // Capture Facebook sender ID for replies\n    fbSenderId = senderId;\n    \n    // Check for media attachments\n    const attachments = messaging.message?.attachments || [];\n    if (attachments.length > 0) {\n      hasMedia = true;\n      \n      for (const att of attachments) {\n        const attType = att.type === 'fallback' ? 'file' : att.type;\n        mediaAttachments.push({\n          type: attType,\n          url: att.payload?.url\n        });\n      }\n      \n      mediaType = mediaAttachments[0].type;\n      mediaUrl = mediaAttachments[0].url;\n      \n      // If no text but has media, set placeholder\n      if (!messageContent) {\n        messageContent = '[Customer sent ' + mediaType + ']';\n      }\n    }\n  }\n\n// ===========================================\n// GMAIL FORMAT\n// ===========================================\n} else if (body.threadId || body.labelIds) {\n  sourceChannel = 'email';\n  \n  // Capture Gmail IDs for reply functionality\n  gmailMessageId = body.id || '';\n  gmailThreadId = body.threadId || '';\n  \n  // Get message content\n  messageContent = body.snippet || body.text || body.body || '';\n  \n  // Try to decode base64 body\n  if (body.payload?.body?.data) {\n    try {\n      const decoded = Buffer.from(body.payload.body.data, 'base64').toString('utf-8');\n      messageContent = decoded.replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim() || messageContent;\n    } catch (e) {}\n  }\n  \n  // Try parts for multipart messages\n  if (!messageContent && body.payload?.parts) {\n    for (const part of body.payload.parts) {\n      if (part.mimeType === 'text/plain' && part.body?.data) {\n        try {\n          messageContent = Buffer.from(part.body.data, 'base64').toString('utf-8');\n          break;\n        } catch (e) {}\n      }\n    }\n  }\n  \n  // Get headers\n  const headers = body.payload?.headers || [];\n  const fromHeader = headers.find(h => h.name?.toLowerCase() === 'from');\n  const subjectHeader = headers.find(h => h.name?.toLowerCase() === 'subject');\n  \n  const fromField = fromHeader?.value || body.From || body.from || '';\n  subject = subjectHeader?.value || body.Subject || body.subject || '';\n  \n  // Extract email and name\n  const emailMatch = fromField.match(/<([^>]+)>/) || fromField.match(/([^\\s]+@[^\\s]+)/);\n  customerEmail = emailMatch ? emailMatch[1] : fromField;\n  \n  const nameMatch = fromField.match(/^([^<]+)</);\n  customerName = nameMatch ? nameMatch[1].trim().replace(/\"/g, '') : customerEmail.split('@')[0];\n  \n  senderId = customerEmail;\n\n  // Check for attachments\n  if (body.payload?.parts) {\n    for (const part of body.payload.parts) {\n      if (part.filename && part.filename.length > 0) {\n        const filename = part.filename.toLowerCase();\n        let type = 'file';\n        if (filename.match(/\\.(jpg|jpeg|png|gif|webp|bmp|svg)$/i)) type = 'image';\n        else if (filename.match(/\\.(mp4|mov|avi|webm|mkv|flv|wmv|3gp)$/i)) type = 'video';\n        else if (filename.match(/\\.(mp3|wav|ogg|m4a|aac|wma|flac|opus|amr)$/i)) type = 'audio';\n        \n        mediaAttachments.push({\n          type: type,\n          filename: part.filename,\n          mimeType: part.mimeType,\n          attachmentId: part.body?.attachmentId\n        });\n      }\n    }\n    \n    if (mediaAttachments.length > 0) {\n      hasMedia = true;\n      mediaType = mediaAttachments[0].type;\n    }\n  }\n\n// ===========================================\n// FALLBACK\n// ===========================================\n} else {\n  messageContent = body.text || body.message || body.content || item.text || '';\n  customerEmail = body.email || body.from || 'unknown@unknown.com';\n  customerName = body.name || body.sender || 'Unknown';\n  senderId = body.sender_id || body.senderId || customerEmail;\n  sourceChannel = body.channel || body.source || 'webhook';\n}\n\n// Ensure string\nmessageContent = String(messageContent || '').trim();\n\n// Generate ticket ID\nconst ticketId = 'TICKET-' + Date.now() + Math.random().toString(36).substring(2, 6).toUpperCase();\n\n// Determine processing needs\nconst needsTranscription = hasMedia && (mediaType === 'audio' || mediaType === 'video');\nconst needsImageAnalysis = hasMedia && mediaType === 'image';\n\n// ===========================================\n// RETURN UNIFIED FORMAT\n// ===========================================\nreturn {\n  json: {\n    // Ticket info\n    ticket_id: ticketId,\n    timestamp: new Date().toISOString(),\n    \n    // Customer info\n    customer_name: customerName,\n    customer_email: customerEmail,\n    sender_id: senderId,\n    \n    // Channel info\n    source_channel: sourceChannel,\n    subject: subject,\n    \n    // Reply IDs (for sending responses)\n    gmail_message_id: gmailMessageId,\n    gmail_thread_id: gmailThreadId,\n    fb_sender_id: fbSenderId,\n    \n    // Message content\n    original_text: messageContent,\n    customer_text: messageContent,\n    \n    // Media info\n    has_media: hasMedia,\n    media_type: mediaType,\n    media_url: mediaUrl,\n    media_attachments: mediaAttachments,\n    \n    // Processing flags\n    needs_transcription: needsTranscription,\n    needs_image_analysis: needsImageAnalysis,\n    \n    // Will be filled later\n    was_transcribed: false,\n    transcription: null,\n    \n    // Raw data for debugging\n    raw_data: item\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5648,
+        -1472
+      ],
+      "id": "10f51b67-ac06-4477-95c8-9d2dc9651d74",
+      "name": "Parse gmail and Fb messages"
+    },
+    {
+      "parameters": {
+        "multipleMethods": true,
+        "path": "02df64b5-3af9-4b28-ab17-0a96a12ab824",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -6144,
+        -1792
+      ],
+      "id": "899dd98d-a8ff-402f-8dcf-33f0d8ff5cb8",
+      "name": "Facebook Messenger Trigger",
+      "webhookId": "02df64b5-3af9-4b28-ab17-0a96a12ab824"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "==== CUSTOMER MESSAGE ===\nTicket ID: {{ $json.ticket_id || 'N/A' }}\nChannel: {{ $json.source_channel || 'facebook' }}\nOriginal Format: {{ $json.media_type || 'text' }}\n{{ $json.was_transcribed ? '(This was transcribed from audio by Gemini)' : '' }}\n\n=== CUSTOMER INFO ===\nName: {{ $json.customer_name || 'Customer' }}\nEmail: {{ $json.customer_email || 'N/A' }}\n\n=== MESSAGE CONTENT ===\n{{ $json.customer_text }}\n\n=== EXTRACTED INFO ===\nOrder ID: {{ $json.order_id || 'Not mentioned' }}\n\n=== INSTRUCTIONS ===\n{{ $json.order_id ? 'Look up order ' + $json.order_id + ' in Order_Lookup sheet.' : 'Help the customer with their inquiry.' }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "=You are the AI Customer Service Assistant for UrbanKicks, a premium sneaker retailer.\n\n## CRITICAL RULES\n1. ALWAYS use Google Sheets tools to look up information - NEVER make up data\n2. Use the customer name and email FROM THE GOOGLE SHEET, not from the message\n3. Customer messages may have been transcribed from audio/video or analyzed from images\n4. Always respond in TEXT format (even if customer sent audio/video/image)\n\n## AVAILABLE TOOLS\n\n### Order_Lookup (Google Sheets)\n- USE WHEN: Customer mentions order ID (like UK-9904) or asks about their order\n- SEARCH BY: order_id column\n- RETURNS: customer_name, customer_email, product, size, status, tracking_number, order_date\n\n### FAQ_Lookup (Google Sheets)\n- USE WHEN: Customer asks about policies, shipping, returns, payments, exchanges\n- SEARCH BY: question or category column\n- RETURNS: answer\n\n### Sizing_Lookup (Google Sheets)\n- USE WHEN: Customer asks about sizes, fit, measurements, what size to get\n- SEARCH BY: brand and/or product column\n- RETURNS: size_chart, fit_notes, recommendations\n\n### Product_Lookup (Google Sheets)\n- USE WHEN: Customer asks about stock, prices, availability\n- SEARCH BY: product_name or brand column\n- RETURNS: price, stock_status, colors_available\n\n## RESPONSE FORMAT\n\nFor ORDER inquiries (use data from Google Sheets):\n\"Hello [NAME FROM SHEET]! I found your order [ORDER_ID] registered to [EMAIL FROM SHEET].\n\n📦 Order Details:\n- Product: [FROM SHEET]\n- Size: [FROM SHEET]\n- Status: [FROM SHEET]\n- Tracking: [FROM SHEET]\n\n[Helpful next steps based on status]\n\nIs there anything else I can help you with?\"\n\nFor SIZING questions:\n\"Based on our sizing guide for [BRAND/PRODUCT]:\n[INFO FROM SHEET]\n\nWould you like help with anything else?\"\n\nFor FAQ/POLICY questions:\n\"[ANSWER FROM SHEET]\n\nIs there anything else I can help you with?\"\n\nFor PRODUCT inquiries:\n\"[INFO FROM SHEET about availability, price, colors]\n\nWould you like help with anything else?\"\n\n## IMPORTANT NOTES\n- Audio/video messages have been transcribed - respond to the content\n- Image contents have been analyzed - respond based on description\n- ALWAYS use the tools - never guess or make up information\n- Be friendly, professional, and helpful\n- Sign off as \"- UrbanKicks Support Team"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3,
+      "position": [
+        -3584,
+        -1536
+      ],
+      "id": "3b1e11b3-d421-4beb-a2af-9aaf0dffe5e6",
+      "name": "AI Agent",
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "options": {
+          "maxOutputTokens": 300,
+          "temperature": 0.7
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -3760,
+        -976
+      ],
+      "id": "3731e309-1df5-4f23-af33-e23804f8469a",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "2b4jNPaKiAFXA1fU",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Escalation Checker').item.json.source_channel }}_{{ $('Escalation Checker').item.json.sender_id }}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        -3600,
+        -960
+      ],
+      "id": "b06d68bd-0181-410d-a14e-b8e98ec93bd9",
+      "name": "Simple Memory"
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Look up an UrbanKicks order by Order ID. Use this tool when customer asks about their order status, shipping, delivery date, or any order-related question. Returns customer name, order status, shipping info, and order details. Input required: order_id (format: UK-XXXX)",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1cJR4D17MrtBepIZD5S3ojYvnXmPNs8aSVjjuK_84XSU/edit?gid=0#gid=0",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Orders_DB",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "Order_ID",
+              "lookupValue": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('values0_Value', ``, 'string') }}"
+            }
+          ]
+        },
+        "options": {
+          "dataLocationOnSheet": {
+            "values": {
+              "rangeDefinition": "specifyRangeA1",
+              "range": "A:Z"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.googleSheetsTool",
+      "typeVersion": 4.7,
+      "position": [
+        -3136,
+        -944
+      ],
+      "id": "e55f7e3d-7695-4ff5-aa7a-e7c2f9fd63a7",
+      "name": "Order_lookup",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "wtBJSmYCXn71VJVt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Look up sizing guidance for sneaker brands and models. Use this when customer asks about sizing, fit, or \"true to size\" questions. Input the brand name (Nike, Adidas, New Balance, etc.) to get sizing recommendations.",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1cJR4D17MrtBepIZD5S3ojYvnXmPNs8aSVjjuK_84XSU/edit?gid=579610180#gid=579610180",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sizing_guide",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "Brand",
+              "lookupValue": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('values0_Value', ``, 'string') }}"
+            }
+          ]
+        },
+        "options": {
+          "dataLocationOnSheet": {
+            "values": {
+              "rangeDefinition": "specifyRangeA1",
+              "range": "A:Z"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.googleSheetsTool",
+      "typeVersion": 4.7,
+      "position": [
+        -3312,
+        -944
+      ],
+      "id": "7f182f56-7b99-4f44-8d00-5b645bdca6e3",
+      "name": "sizing-lookup",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "wtBJSmYCXn71VJVt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Search the FAQ knowledge base to answer customer questions about sizing, shipping, payments, returns, product info, care, and general inquiries. Use this when customer asks general questions that don't require order lookup. Input relevant keywords from the customer's question to find answers.",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1cJR4D17MrtBepIZD5S3ojYvnXmPNs8aSVjjuK_84XSU/edit?gid=383654707#gid=383654707",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "FAQ",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "Category",
+              "lookupValue": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('values0_Value', ``, 'string') }}"
+            }
+          ]
+        },
+        "options": {
+          "dataLocationOnSheet": {
+            "values": {
+              "rangeDefinition": "specifyRangeA1",
+              "range": "A:Z"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.googleSheetsTool",
+      "typeVersion": 4.7,
+      "position": [
+        -3424,
+        -960
+      ],
+      "id": "73ca9203-6428-4228-a8c0-c5129db48b2e",
+      "name": "FAQ-Knowledge_base",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "wtBJSmYCXn71VJVt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.gmail_sender_id || $json.sender_id || $json.customer_email }}\n",
+        "subject": "=Re: {{ $json.subject || 'Your UrbanKicks Support Query' }}",
+        "message": "={{ $json.ai_response }}\n\n---\nBest regards,\nUrbanKicks Support Team\n\nTicket ID: {{ $json.ticket_id }}\nEmail: support@urbankicks.com\nPhone/WhatsApp: +234 809 123 4567",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -2640,
+        -1568
+      ],
+      "id": "9022ce3c-8b55-497b-8d94-c0b0f5df38a2",
+      "name": "Gmail reply",
+      "webhookId": "8bad03f6-8bc3-493b-bb74-00f7050dfbcc",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "em1fM0BT3E4AgVlG",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v18.0/me/messages",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "access_token",
+              "value": "EAAWFUah8gHEBQIBBPXr7Oy52gZBditao48DCJaUHaDK1xBMHSPfkNKKXctsaugqgveMWhKsKLFmWPcElvfUBCq4ZCRfKimkdXQnEhZBXqGdiTfrUFGc3GXfmXKEJQtZBBtthvP0ZCpQuKMm0VZAkdBnhguPRhmyI7kYuY7d18sOVEZC0CCKTRqrItcfoq7fsDiqmP1In6X9ZCgZDZD"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "=recipient.id",
+              "value": "={{ $json.sender_id }}"
+            },
+            {
+              "name": "=message.text",
+              "value": "={{ $json.ai_response }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2656,
+        -1808
+      ],
+      "id": "de7cb14d-ffaa-4f99-a19c-b68fb22004f6",
+      "name": "FB reply"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1cJR4D17MrtBepIZD5S3ojYvnXmPNs8aSVjjuK_84XSU/edit?gid=585079766#gid=585079766",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Support_ticket_log",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Ticket_ID": "={{ $json.ticket_id }}",
+            "Timestamp": "={{ $json.timestamp }}",
+            "channel": "={{ $json.source_channel }}",
+            "customer_name": "={{ $json.customer_name }}",
+            "customer_email": "={{ $json.customer_email }}",
+            "sender_id": "={{ $json.sender_id }}",
+            "message": "={{ $json.customer_text }}",
+            "media_type": "={{ $json.media_type }}",
+            "was_transcribed": "={{ $json.was_transcribed }}",
+            "order_id": "={{ $json.order_id }}",
+            "sentiment": "={{ $json.sentiment }}",
+            "escalated": "false",
+            "resolution_status": "={{ $json.resolution_status }}",
+            "ai_response": "={{ $json.ai_response }}",
+            "escalation_reason": "false",
+            "inquiry_type": "={{ $json.inquiry_type }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Ticket_ID",
+              "displayName": "Ticket_ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Timestamp",
+              "displayName": "Timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "channel",
+              "displayName": "channel",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "customer_name",
+              "displayName": "customer_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "customer_email",
+              "displayName": "customer_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sender_id",
+              "displayName": "sender_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "media_type",
+              "displayName": "media_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "was_transcribed",
+              "displayName": "was_transcribed",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "order_id",
+              "displayName": "order_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "inquiry_type",
+              "displayName": "inquiry_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sentiment",
+              "displayName": "sentiment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "escalated",
+              "displayName": "escalated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "resolution_status",
+              "displayName": "resolution_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ai_response",
+              "displayName": "ai_response",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "escalation_reason",
+              "displayName": "escalation_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -2624,
+        -1248
+      ],
+      "id": "9f86e40a-49ec-42b7-bcb1-da5f2ae9d2be",
+      "name": "Log ticket to google sheets",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "wtBJSmYCXn71VJVt",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"success\": true\n}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -5888,
+        -1664
+      ],
+      "id": "5ac4e77f-54be-4fb3-a84b-e1018f577dbf",
+      "name": "Sends back response via FB"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "efe1f476-f2a2-4c9f-8598-4bcaee2b6602",
+              "leftValue": "={{$json.shouldEscalate}}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -3920,
+        -1520
+      ],
+      "id": "f2dabe13-ca20-43e9-810c-24a7874c967d",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0A0ZLDFGKZ",
+          "mode": "list",
+          "cachedResultName": "all-automation"
+        },
+        "text": "=🚨 *ESCALATION ALERT* 🚨\n\n*Priority:* {{ $json.priority.toUpperCase() }}\n*Score:* {{ $json.escalationScore }}\n*Reason:* {{ $json.escalationReasonText }}\n\n━━━━━━━━━━━━━━━━━━━━\n\n*📋 Ticket:* {{ $json.ticket_id }}\n*📱 Channel:* {{ $json.source_channel }}\n*📎 Original Format:* {{ $json.media_type }}\n{{ $json.was_transcribed ? '✅ Transcribed from ' + $json.media_type : '' }}\n\n━━━━━━━━━━━━━━━━━━━━\n\n*👤 Customer:*\n- Name: {{ $json.customer_name }}\n- Email: {{ $json.customer_email }}\n- Sender ID: {{ $json.sender_id }}\n\n━━━━━━━━━━━━━━━━━━━━\n\n*💬 Message{{ $json.was_transcribed ? ' (Transcribed)' : '' }}:*\n```\n{{ $json.customer_text }}\n```\n\n{{ $json.order_id ? '📦 *Order ID:* ' + $json.order_id : '' }}\n{{ $json.product_mentioned ? '👟 *Product:* ' + $json.product_mentioned : '' }}\n{{ $json.issue_type ? '⚠️ *Issue:* ' + $json.issue_type : '' }}\n{{ $json.action_requested ? '🎯 *Action Requested:* ' + $json.action_requested : '' }}\n{{ $json.image_analysis ? '📷 *Image Analysis:* ' + $json.image_analysis.description : '' }}\n\n━━━━━━━━━━━━━━━━━━━━\n\n{{ $json.media_url ? '🔗 *Media URL:* ' + $json.media_url : '' }}\n\n⏰ {{ $json.timestamp }}\n_Please respond within 4 hours_\n",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        -3648,
+        -2000
+      ],
+      "id": "412d5e90-1729-4257-a5d2-8b9ce7e792a9",
+      "name": "Send a message",
+      "webhookId": "2a32e8a9-8b11-4563-8515-176333e6c60f",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "BWPKJQDZfztDVHPz",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ===========================================\n// NODE 8: ESCALATION CHECKER\n// Analyzes text (including transcribed audio/video/image) for complaints\n// Score >= 5 = Escalate to Slack\n// ===========================================\n\nconst input = $json;\nconst text = (input.customer_text || '').toLowerCase();\nconst subject = (input.subject || '').toLowerCase();\nconst combinedText = text + ' ' + subject;\n\nconst hasMedia = input.has_media === true;\nconst mediaType = input.media_type || 'text';\nconst wasTranscribed = input.was_transcribed === true;\n\nlet score = 0;\nlet reasons = [];\n\n// ===========================================\n// LEGAL THREATS (+10) - ALWAYS ESCALATE\n// ===========================================\nif (combinedText.includes('sue')) { score += 10; reasons.push('⚖️ sue'); }\nif (combinedText.includes('lawyer')) { score += 10; reasons.push('⚖️ lawyer'); }\nif (combinedText.includes('attorney')) { score += 10; reasons.push('⚖️ attorney'); }\nif (combinedText.includes('lawsuit')) { score += 10; reasons.push('⚖️ lawsuit'); }\nif (combinedText.includes('legal action')) { score += 10; reasons.push('⚖️ legal action'); }\nif (combinedText.includes('court')) { score += 5; reasons.push('⚖️ court'); }\n\n// ===========================================\n// OFFENSIVE (+5)\n// ===========================================\nif (combinedText.includes('scam')) { score += 5; reasons.push('🚨 scam'); }\nif (combinedText.includes('fraud')) { score += 5; reasons.push('🚨 fraud'); }\nif (combinedText.includes('fake')) { score += 5; reasons.push('🚨 fake'); }\nif (combinedText.includes('stolen')) { score += 5; reasons.push('🚨 stolen'); }\nif (combinedText.includes('counterfeit')) { score += 5; reasons.push('🚨 counterfeit'); }\nif (combinedText.includes('rip off') || combinedText.includes('ripoff')) { score += 5; reasons.push('🚨 rip off'); }\nif (combinedText.includes('chargeback')) { score += 5; reasons.push('💳 chargeback'); }\nif (combinedText.includes('bbb') || combinedText.includes('better business bureau')) { score += 5; reasons.push('⚠️ BBB'); }\nif (combinedText.includes('report you') || combinedText.includes('report this')) { score += 5; reasons.push('⚠️ report'); }\n\n// ===========================================\n// STRONG NEGATIVE (+4)\n// ===========================================\nif (combinedText.includes('worst')) { score += 4; reasons.push('😡 worst'); }\nif (combinedText.includes('terrible')) { score += 4; reasons.push('😡 terrible'); }\nif (combinedText.includes('horrible')) { score += 4; reasons.push('😡 horrible'); }\nif (combinedText.includes('disgusting')) { score += 4; reasons.push('😡 disgusting'); }\nif (combinedText.includes('unacceptable')) { score += 4; reasons.push('😡 unacceptable'); }\nif (combinedText.includes('pathetic')) { score += 4; reasons.push('😡 pathetic'); }\nif (combinedText.includes('hate')) { score += 4; reasons.push('😡 hate'); }\nif (combinedText.includes('never again')) { score += 4; reasons.push('👋 never again'); }\nif (combinedText.includes('waste of money')) { score += 4; reasons.push('💸 waste'); }\nif (combinedText.includes('awful')) { score += 4; reasons.push('😡 awful'); }\n\n// ===========================================\n// ANGRY (+3)\n// ===========================================\nif (combinedText.includes('angry')) { score += 3; reasons.push('😠 angry'); }\nif (combinedText.includes('furious')) { score += 3; reasons.push('😠 furious'); }\nif (combinedText.includes('outraged')) { score += 3; reasons.push('😠 outraged'); }\nif (combinedText.includes('pissed')) { score += 3; reasons.push('😠 pissed'); }\nif (combinedText.includes('frustrated')) { score += 2; reasons.push('😤 frustrated'); }\n\n// ===========================================\n// BAD + REFUND COMBO (+5)\n// ===========================================\nconst hasBadWord = combinedText.includes('bad') || combinedText.includes('poor');\nconst hasRefundWord = combinedText.includes('refund') || combinedText.includes('money back');\n\nif (hasBadWord && hasRefundWord) {\n  score += 5;\n  reasons.push('💰 bad + refund');\n}\n\n// ===========================================\n// MEDIA WITH ISSUE (+3)\n// ===========================================\nif (input.image_analysis?.issue && input.image_analysis.issue.toLowerCase() !== 'none') {\n  score += 3;\n  reasons.push('📷 image shows: ' + input.image_analysis.issue);\n}\n\nif (input.issue_from_media) {\n  score += 3;\n  reasons.push('🎥 media shows: ' + input.issue_from_media);\n}\n\n// ===========================================\n// MEDIA + COMPLAINT BONUS (+2)\n// ===========================================\nif (hasMedia && wasTranscribed && score >= 3) {\n  score += 2;\n  const emoji = mediaType === 'audio' ? '🎤' : mediaType === 'video' ? '🎥' : '📷';\n  reasons.push(`${emoji} ${mediaType} with complaint`);\n}\n\n// ===========================================\n// ALL CAPS (+3)\n// ===========================================\nconst originalText = input.customer_text || '';\nif (originalText.length > 15 && originalText === originalText.toUpperCase()) {\n  score += 3;\n  reasons.push('🔊 ALL CAPS');\n}\n\n// ===========================================\n// URGENCY WORDS (+1)\n// ===========================================\nif (combinedText.includes('immediately') || combinedText.includes('right now') || combinedText.includes('asap')) {\n  score += 1;\n  reasons.push('⏰ urgent');\n}\n\n// ===========================================\n// DETERMINE ESCALATION\n// ===========================================\nconst shouldEscalate = score >= 5;\n\nlet priority = 'low';\nif (score >= 10) priority = 'critical';\nelse if (score >= 5) priority = 'high';\nelse if (score >= 3) priority = 'medium';\n\nlet sentiment = 'neutral';\nif (score >= 4) sentiment = 'negative';\nelse if (/thank|thanks|great|awesome|love|excellent|perfect|amazing/i.test(combinedText) && score === 0) {\n  sentiment = 'positive';\n}\n\n// ===========================================\n// RETURN\n// ===========================================\nreturn {\n  json: {\n    ...input,\n    sentiment: sentiment,\n    shouldEscalate: shouldEscalate,\n    escalationScore: score,\n    priority: priority,\n    escalationReasonText: reasons.length > 0 ? reasons.join('; ') : 'none',\n    flags: {\n      is_complaint: score >= 5,\n      has_media: hasMedia,\n      media_type: mediaType,\n      was_transcribed: wasTranscribed,\n      negative_sentiment: sentiment === 'negative'\n    }\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4096,
+        -1520
+      ],
+      "id": "7c88571e-6996-416c-9655-a465b9da6daf",
+      "name": "Escalation Checker"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8626bc12-a3e5-4366-ae7f-0c800df4ff10",
+              "leftValue": "={{ $json.has_media }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -5472,
+        -1472
+      ],
+      "id": "6c9c0cb3-1c27-44d9-8666-ff6c106462f0",
+      "name": "If Has Media"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=AIzaSyBPudQnkleNazk96FdTyi5vHi8LGoYmUVM",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  \"contents\": [{\n    \"parts\": [\n      { \"text\": $json.prompt },\n      {\n        \"inlineData\": {\n          \"mimeType\": $json.mimeType,\n          \"data\": $json.base64Data\n        }\n      }\n    ]\n  }],\n  \"generationConfig\": {\n    \"temperature\": 0.1,\n    \"maxOutputTokens\": 1000\n  }\n}) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -4848,
+        -1776
+      ],
+      "id": "faf60953-8749-4247-bc16-9d153f695f3f",
+      "name": "Process media"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Process Gemini Response - COMPLETE\n\nconst geminiResponse = $json;\n\n// Extract transcription\nlet transcribedText = '';\nif (geminiResponse.candidates?.[0]?.content?.parts?.[0]?.text) {\n  transcribedText = geminiResponse.candidates[0].content.parts[0].text.trim();\n}\n\n// Extract order ID from transcription\nlet orderId = null;\nconst match = transcribedText.match(/UK-?\\s*(\\d{4,})/i);\nif (match) {\n  orderId = 'UK-' + match[1];\n}\n\n// Extract issue if mentioned\nlet issue = null;\nif (/damage|broken|torn|defect/i.test(transcribedText)) issue = 'damaged';\nelse if (/wrong|incorrect/i.test(transcribedText)) issue = 'wrong_item';\nelse if (/missing|not included/i.test(transcribedText)) issue = 'missing';\n\n// Get original data from If Has Media node\nlet originalData = {};\ntry {\n  originalData = $('If Has Media').first().json || {};\n} catch (e) {\n  originalData = {};\n}\n\nreturn {\n  json: {\n    // Original customer info\n    ticket_id: originalData.ticket_id || 'TICKET-' + Date.now(),\n    timestamp: originalData.timestamp || new Date().toISOString(),\n    customer_name: originalData.customer_name || 'Unknown',\n    customer_email: originalData.customer_email || '',\n    sender_id: originalData.sender_id || '',\n    source_channel: originalData.source_channel || 'facebook',\n    \n    // Transcribed content - THIS IS THE KEY\n    customer_text: transcribedText,\n    transcription: transcribedText,\n    original_text: originalData.original_text || '',\n    \n    // Extracted from transcription\n    order_id: orderId,\n    order_id_from_media: orderId,\n    issue_from_media: issue,\n    \n    // Media flags\n    has_media: true,\n    media_type: originalData.media_type || 'audio',\n    media_url: originalData.media_url || '',\n    was_transcribed: true,\n    transcription_source: 'gemini',\n    \n    // Pass through\n    raw_data: originalData.raw_data\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4640,
+        -1568
+      ],
+      "id": "a89b414c-0ef3-4ea7-b516-8b050a5f6c01",
+      "name": "Process Gemini Response"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ===========================================\n// NODE 7: EXTRACT INFO\n// Extracts order ID, brand, size, color, issue, etc.\n// Works with both transcribed and original text\n// ===========================================\n\nconst item = $json;\n\n// Get the text to analyze\nconst text = item.customer_text || item.transcription || item.original_text || '';\nconst subject = item.subject || '';\nconst combinedText = (text + ' ' + subject).trim();\nconst lowerText = combinedText.toLowerCase();\n\n// ===========================================\n// EXTRACT ORDER ID\n// ===========================================\nlet orderId = item.order_id_from_media || null;\n\nif (!orderId) {\n  const orderPatterns = [\n    /UK-\\s*(\\d{4,})/i,\n    /UK\\s*(\\d{4,})/i,\n    /order\\s*#?\\s*(\\d{4,})/i,\n    /order\\s*number\\s*[:\\s]*(\\d{4,})/i,\n    /order\\s+id[:\\s]*([A-Z0-9-]+)/i,\n    /#(\\d{4,})/\n  ];\n  \n  for (const pattern of orderPatterns) {\n    const match = combinedText.match(pattern);\n    if (match) {\n      const num = match[1] || match[0];\n      orderId = 'UK-' + num.replace(/\\D/g, '');\n      break;\n    }\n  }\n}\n\n// ===========================================\n// EXTRACT TRACKING NUMBER\n// ===========================================\nlet trackingNumber = null;\nconst trackingPatterns = [\n  /1Z[A-Z0-9]{16}/i,  // UPS\n  /\\b\\d{12,22}\\b/,     // FedEx, USPS\n  /tracking[:\\s#]*([A-Z0-9]{10,})/i\n];\n\nfor (const pattern of trackingPatterns) {\n  const match = combinedText.match(pattern);\n  if (match) {\n    trackingNumber = (match[1] || match[0]).toUpperCase();\n    break;\n  }\n}\n\n// ===========================================\n// EXTRACT BRAND\n// ===========================================\nconst brands = {\n  'Nike': /\\bnike\\b|air max|air force|dunk|blazer/i,\n  'Jordan': /\\bjordan\\b|aj\\d/i,\n  'Adidas': /\\badidas\\b|yeezy|ultra boost|superstar/i,\n  'Converse': /\\bconverse\\b|chuck taylor|chuck 70/i,\n  'New Balance': /new balance|nb\\s*\\d{3,4}/i,\n  'Vans': /\\bvans\\b|old skool/i,\n  'Puma': /\\bpuma\\b/i,\n  'Reebok': /\\breebok\\b/i\n};\n\nlet brandMentioned = null;\nfor (const [brand, pattern] of Object.entries(brands)) {\n  if (pattern.test(lowerText)) {\n    brandMentioned = brand;\n    break;\n  }\n}\n\n// ===========================================\n// EXTRACT PRODUCT\n// ===========================================\nconst products = [\n  { pattern: /air\\s*max\\s*97/i, name: 'Air Max 97', brand: 'Nike' },\n  { pattern: /air\\s*max\\s*95/i, name: 'Air Max 95', brand: 'Nike' },\n  { pattern: /air\\s*max\\s*90/i, name: 'Air Max 90', brand: 'Nike' },\n  { pattern: /air\\s*max\\s*1\\b/i, name: 'Air Max 1', brand: 'Nike' },\n  { pattern: /air\\s*force\\s*1|af1/i, name: 'Air Force 1', brand: 'Nike' },\n  { pattern: /dunk\\s*(low|high)?/i, name: 'Dunk', brand: 'Nike' },\n  { pattern: /blazer/i, name: 'Blazer', brand: 'Nike' },\n  { pattern: /jordan\\s*1|aj1/i, name: 'Jordan 1', brand: 'Jordan' },\n  { pattern: /jordan\\s*4/i, name: 'Jordan 4', brand: 'Jordan' },\n  { pattern: /jordan\\s*11/i, name: 'Jordan 11', brand: 'Jordan' },\n  { pattern: /yeezy\\s*350/i, name: 'Yeezy 350', brand: 'Adidas' },\n  { pattern: /yeezy\\s*500/i, name: 'Yeezy 500', brand: 'Adidas' },\n  { pattern: /yeezy\\s*700/i, name: 'Yeezy 700', brand: 'Adidas' },\n  { pattern: /ultra\\s*boost/i, name: 'Ultra Boost', brand: 'Adidas' },\n  { pattern: /superstar/i, name: 'Superstar', brand: 'Adidas' },\n  { pattern: /chuck\\s*70/i, name: 'Chuck 70', brand: 'Converse' },\n  { pattern: /chuck\\s*taylor/i, name: 'Chuck Taylor', brand: 'Converse' },\n  { pattern: /old\\s*skool/i, name: 'Old Skool', brand: 'Vans' }\n];\n\nlet productMentioned = null;\nfor (const product of products) {\n  if (product.pattern.test(lowerText)) {\n    productMentioned = product.name;\n    if (!brandMentioned) brandMentioned = product.brand;\n    break;\n  }\n}\n\n// ===========================================\n// EXTRACT SIZE\n// ===========================================\nlet sizeMentioned = null;\nlet sizeType = 'US';\n\nconst sizePatterns = [\n  { pattern: /\\bus\\s*(\\d+\\.?\\d*)/i, type: 'US' },\n  { pattern: /\\buk\\s*(\\d+\\.?\\d*)/i, type: 'UK' },\n  { pattern: /\\beu\\s*(\\d+\\.?\\d*)/i, type: 'EU' },\n  { pattern: /size\\s*(\\d+\\.?\\d*)/i, type: 'US' },\n  { pattern: /(\\d+\\.?\\d*)\\s*(us|uk|eu)/i, type: null }\n];\n\nfor (const sp of sizePatterns) {\n  const match = combinedText.match(sp.pattern);\n  if (match) {\n    sizeMentioned = match[1];\n    if (sp.type) {\n      sizeType = sp.type;\n    } else if (match[2]) {\n      sizeType = match[2].toUpperCase();\n    }\n    break;\n  }\n}\n\n// ===========================================\n// EXTRACT COLOR\n// ===========================================\nconst colors = [\n  'black', 'white', 'red', 'blue', 'green', 'yellow', 'orange',\n  'purple', 'pink', 'brown', 'grey', 'gray', 'navy', 'beige',\n  'cream', 'gold', 'silver', 'bred', 'chicago', 'royal',\n  'shadow', 'mocha', 'travis', 'panda', 'zebra', 'triple white'\n];\n\nlet colorMentioned = null;\nfor (const color of colors) {\n  if (lowerText.includes(color)) {\n    colorMentioned = color;\n    break;\n  }\n}\n\n// ===========================================\n// DETECT ISSUE TYPE\n// ===========================================\nlet issueType = item.issue_from_media || null;\n\nif (!issueType) {\n  const issues = {\n    'damaged': /damaged|broken|torn|ripped|crushed|cracked|scratched/i,\n    'wrong_item': /wrong (item|product|shoe|order|color|model)|received.*(wrong|different)|not what i ordered/i,\n    'wrong_size': /wrong size|size.*(wrong|incorrect)|too (big|small|tight|loose)/i,\n    'missing': /missing|not included|didn't receive|never got|incomplete/i,\n    'defective': /defective|defect|faulty|not working|manufacturing/i,\n    'late': /late|delayed|still waiting|taking too long|slow/i,\n    'not_delivered': /not delivered|never arrived|didn't arrive|lost/i,\n    'fake': /fake|counterfeit|not authentic|not real|replica/i,\n    'quality': /quality|cheap|poor quality|bad quality/i\n  };\n  \n  for (const [issue, pattern] of Object.entries(issues)) {\n    if (pattern.test(lowerText)) {\n      issueType = issue;\n      break;\n    }\n  }\n}\n\n// ===========================================\n// DETECT ACTION REQUESTED\n// ===========================================\nconst actions = {\n  'refund': /refund|money back|get my money/i,\n  'exchange': /exchange|swap|replace|replacement|new one/i,\n  'return': /return|send back|send it back/i,\n  'cancel': /cancel|cancellation/i,\n  'track': /track|where is|where's|status|update/i,\n  'expedite': /faster|rush|expedite|asap|urgent/i,\n  'complaint': /complain|complaint|report/i\n};\n\nlet actionRequested = null;\nfor (const [action, pattern] of Object.entries(actions)) {\n  if (pattern.test(lowerText)) {\n    actionRequested = action;\n    break;\n  }\n}\n\n// ===========================================\n// DETECT MESSAGE INTENT\n// ===========================================\nlet messageIntent = 'general_inquiry';\n\nif (orderId || /where.*(order|package|delivery)|track|status|shipping|delivered/i.test(lowerText)) {\n  messageIntent = 'order_inquiry';\n} else if (/size|sizing|fit|measurement|width|length/i.test(lowerText)) {\n  messageIntent = 'sizing_question';\n} else if (/policy|return|refund|exchange|shipping time|payment|discount|promo/i.test(lowerText)) {\n  messageIntent = 'faq_question';\n} else if (/stock|available|availability|price|cost|how much/i.test(lowerText)) {\n  messageIntent = 'product_inquiry';\n} else if (issueType) {\n  messageIntent = 'issue_report';\n} else if (/thank|thanks|great|awesome|love|excellent|perfect|amazing/i.test(lowerText)) {\n  messageIntent = 'positive_feedback';\n}\n\n// ===========================================\n// RETURN EXTRACTED DATA\n// ===========================================\nreturn {\n  json: {\n    // Core info\n    ticket_id: item.ticket_id,\n    timestamp: item.timestamp,\n    customer_name: item.customer_name,\n    customer_email: item.customer_email,\n    sender_id: item.sender_id,\n    source_channel: item.source_channel,\n    subject: item.subject,\n    \n    // Message content\n    customer_text: text,\n    original_text: item.original_text,\n    transcription: item.transcription,\n    \n    // Extracted info\n    order_id: orderId,\n    tracking_number: trackingNumber,\n    brand_mentioned: brandMentioned,\n    product_mentioned: productMentioned,\n    size_mentioned: sizeMentioned,\n    size_type: sizeType,\n    color_mentioned: colorMentioned,\n    issue_type: issueType,\n    action_requested: actionRequested,\n    \n    // Intent\n    message_intent: messageIntent,\n    \n    // Media info\n    has_media: item.has_media || false,\n    media_type: item.media_type || 'text',\n    media_url: item.media_url,\n    was_transcribed: item.was_transcribed || false,\n    image_analysis: item.image_analysis,\n    \n    // Lookup hints for AI Agent\n    lookup_hints: {\n      should_lookup_order: orderId !== null,\n      should_lookup_sizing: messageIntent === 'sizing_question',\n      should_lookup_faq: messageIntent === 'faq_question',\n      should_lookup_product: messageIntent === 'product_inquiry'\n    },\n    \n    // Raw data\n    raw_data: item.raw_data\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4288,
+        -1392
+      ],
+      "id": "3e015473-8cf4-4ad3-b3be-3aadb2a0c1d5",
+      "name": "Extract info"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "5fa555aa-8aa7-4510-86d0-a79c61a90120",
+              "leftValue": "={{ $json.source_channel }}",
+              "rightValue": "=facebook",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2912,
+        -1792
+      ],
+      "id": "d978c086-4c4d-45cb-be15-ddc3cbada2c1",
+      "name": "Switch reply to any channel",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.media_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -5280,
+        -1568
+      ],
+      "id": "9964ed5f-5374-4c9a-b089-0428613239b6",
+      "name": "Download media"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Prepare Gemini Request - FIXED\n\nconst input = $input.item;\n\n// Get binary data properly\nlet base64Data = '';\ntry {\n  // Access the actual binary buffer\n  const binaryDataBuffer = await this.helpers.getBinaryDataBuffer(0, 'data');\n  base64Data = binaryDataBuffer.toString('base64');\n} catch (e) {\n  base64Data = '';\n}\n\nconst mediaType = input.json?.media_type || 'audio';\nconst originalText = input.json?.original_text || '';\n\n// Determine MIME type\nlet mimeType = 'audio/mp4';\nif (mediaType === 'image') mimeType = 'image/jpeg';\nif (mediaType === 'video') mimeType = 'video/mp4';\n\n// Build prompt\nlet prompt = 'Transcribe this audio exactly word-for-word. Format order numbers as UK-####. Output ONLY the transcription text.';\n\nif (mediaType === 'video') {\n  prompt = 'Transcribe and describe. Format: SPOKEN: [words] SHOWS: [visual] ORDER_ID: [or none] ISSUE: [or none]';\n}\n\nif (mediaType === 'image') {\n  prompt = 'Analyze image. Format: TEXT_FOUND: [text] PRODUCT: [product] ISSUE: [issue] DESCRIPTION: [description]';\n}\n\nreturn {\n  json: {\n    prompt: prompt,\n    mimeType: mimeType,\n    base64Data: base64Data,\n    mediaType: mediaType,\n    originalText: originalText,\n    hasData: base64Data.length > 0\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5088,
+        -1776
+      ],
+      "id": "7bffba74-0e63-43e7-8164-f5db3e531c88",
+      "name": "Prepare Gemini Request"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -4464,
+        -1392
+      ],
+      "id": "f5760baf-46cf-4d29-8007-a2fdc133796f",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Format Reply - EXTRACT NAME/EMAIL FROM AI RESPONSE\n\nconst aiOutput = $json.output || '';\n\n// Try to get data from Escalation Checker\nlet data = {};\ntry {\n  data = $('Escalation Checker').first().json || {};\n} catch (e) {}\n\n// Try Process Gemini Response for transcription\nlet transcribedText = '';\nlet orderId = '';\nlet wasTranscribed = false;\nlet mediaType = 'text';\n\ntry {\n  const geminiData = $('Process Gemini Response').first().json;\n  if (geminiData) {\n    transcribedText = geminiData.customer_text || geminiData.transcription || '';\n    orderId = geminiData.order_id_from_media || geminiData.order_id || '';\n    wasTranscribed = geminiData.was_transcribed || false;\n    mediaType = geminiData.media_type || 'text';\n  }\n} catch (e) {}\n\n// Fallback order_id from Escalation Checker\nif (!orderId) {\n  orderId = data.order_id || data.order_id_from_media || '';\n}\n\n// Extract customer name from AI response\n// Pattern: \"Hello Emma Wilson!\" or \"Hi Emma Wilson,\" or \"Dear Emma Wilson\"\nlet customerName = data.customer_name || 'Unknown';\nconst nameMatch = aiOutput.match(/(?:Hello|Hi|Dear)\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?)[!,\\.]/i);\nif (nameMatch && nameMatch[1] && nameMatch[1] !== 'Customer' && nameMatch[1] !== 'there') {\n  customerName = nameMatch[1];\n}\n\n// Extract customer email from AI response\n// Pattern: \"registered to emma@test.com\" or \"email: emma@test.com\"\nlet customerEmail = data.customer_email || '';\nconst emailMatch = aiOutput.match(/(?:registered to|email[:\\s]+|to\\s+)([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})/i);\nif (emailMatch && emailMatch[1]) {\n  customerEmail = emailMatch[1];\n}\n\n// Extract sender_id\nlet senderId = data.sender_id || '';\nif (!senderId && data.customer_email && data.customer_email.includes('@facebook.com')) {\n  senderId = data.customer_email.split('@')[0];\n}\n// Keep Facebook sender_id separate from customer email\nlet fbSenderId = senderId;\nif (customerEmail && !customerEmail.includes('@facebook.com')) {\n  // We have real email from order lookup, keep FB sender_id for reply\n  fbSenderId = data.sender_id || senderId;\n}\n\n// Get other extracted data\nlet inquiryType = data.message_intent || 'general_inquiry';\nlet issueType = data.issue_type || data.issue_from_media || '';\nlet sentiment = data.sentiment || 'neutral';\n\n// If order was found, it's likely an order inquiry\nif (orderId) {\n  inquiryType = 'order_inquiry';\n}\n\n// Clean up transcribed text\nif (transcribedText.includes('[Customer sent')) {\n  transcribedText = data.customer_text || '';\n}\nif (!transcribedText) {\n  transcribedText = data.customer_text || '';\n}\n\nreturn {\n  json: {\n    // For reply (use FB sender_id)\n    ai_response: aiOutput,\n    source_channel: data.source_channel || 'facebook',\n    sender_id: fbSenderId,\n    \n    // For logging (use extracted name/email from order lookup)\n    ticket_id: data.ticket_id || 'TICKET-' + Date.now(),\n    timestamp: data.timestamp || new Date().toISOString(),\n    customer_name: customerName,\n    customer_email: customerEmail,\n    customer_text: transcribedText,\n    media_type: mediaType || data.media_type || 'text',\n    was_transcribed: wasTranscribed || data.was_transcribed || false,\n    order_id: orderId,\n    inquiry_type: inquiryType,\n    issue_type: issueType,\n    sentiment: sentiment,\n    resolution_status: 'auto_resolved',\n    escalation_reason: data.escalationReasonText || '',\n    escalation_score: data.escalationScore || 0\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3184,
+        -1536
+      ],
+      "id": "fa1e78fa-1665-4d30-91fc-3505a9f3c086",
+      "name": "Format Reply"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1cJR4D17MrtBepIZD5S3ojYvnXmPNs8aSVjjuK_84XSU/edit?gid=1353823755#gid=1353823755",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Escalated_Support_ticket_log",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Ticket_ID": "={{ $('Escalation Checker').first().json.ticket_id }}",
+            "Timestamp": "={{ $('Escalation Checker').first().json.timestamp }}",
+            "channel": "={{ $('Escalation Checker').first().json.source_channel }}",
+            "customer_name": "={{ $('Escalation Checker').first().json.customer_name }}",
+            "customer_email": "={{ $('Escalation Checker').first().json.customer_email }}",
+            "sender_id": "={{ $('Escalation Checker').first().json.sender_id }}",
+            "message": "={{ $('Escalation Checker').first().json.customer_text }}",
+            "media_type": "={{ $('Escalation Checker').first().json.media_type }}",
+            "was_transcribed": "={{ $('Escalation Checker').first().json.was_transcribed }}",
+            "order_id": "={{ $('Escalation Checker').first().json.order_id }}",
+            "inquiry_type": "={{ $('Escalation Checker').first().json.message_intent }}",
+            "sentiment": "={{ $('Escalation Checker').first().json.sentiment }}",
+            "escalated": "true",
+            "resolution_status": "=escalated",
+            "ai_response": "=ESCALATED TO SLACK",
+            "escalation_reason": "={{ $('Escalation Checker').first().json.escalationReasonText }}",
+            "issue_type": "={{ $('Escalation Checker').first().json.message_intent }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Ticket_ID",
+              "displayName": "Ticket_ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Timestamp",
+              "displayName": "Timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "channel",
+              "displayName": "channel",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "customer_name",
+              "displayName": "customer_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "customer_email",
+              "displayName": "customer_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sender_id",
+              "displayName": "sender_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "message",
+              "displayName": "message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "media_type",
+              "displayName": "media_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "was_transcribed",
+              "displayName": "was_transcribed",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "order_id",
+              "displayName": "order_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "inquiry_type",
+              "displayName": "inquiry_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "issue_type",
+              "displayName": "issue_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sentiment",
+              "displayName": "sentiment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "escalated",
+              "displayName": "escalated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "resolution_status",
+              "displayName": "resolution_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ai_response",
+              "displayName": "ai_response",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "escalation_reason",
+              "displayName": "escalation_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -3200,
+        -2000
+      ],
+      "id": "ee516472-a883-48f7-af99-ccee52a4abf2",
+      "name": "Escalated-ticket-log",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "wtBJSmYCXn71VJVt",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse gmail and Fb messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse gmail and Fb messages": {
+      "main": [
+        [
+          {
+            "node": "If Has Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Facebook Messenger Trigger": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Sends back response via FB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Order_lookup": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "sizing-lookup": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "FAQ-Knowledge_base": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail reply": {
+      "main": [
+        []
+      ]
+    },
+    "FB reply": {
+      "main": [
+        []
+      ]
+    },
+    "Sends back response via FB": {
+      "main": [
+        [
+          {
+            "node": "Parse gmail and Fb messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalation Checker": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a message": {
+      "main": [
+        [
+          {
+            "node": "Escalated-ticket-log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Has Media": {
+      "main": [
+        [
+          {
+            "node": "Download media",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Process media": {
+      "main": [
+        [
+          {
+            "node": "Process Gemini Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Gemini Response": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract info": {
+      "main": [
+        [
+          {
+            "node": "Escalation Checker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch reply to any channel": {
+      "main": [
+        [
+          {
+            "node": "FB reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gmail reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download media": {
+      "main": [
+        [
+          {
+            "node": "Prepare Gemini Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Gemini Request": {
+      "main": [
+        [
+          {
+            "node": "Process media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Extract info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Reply": {
+      "main": [
+        [
+          {
+            "node": "Switch reply to any channel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log ticket to google sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log ticket to google sheets": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "261f46da-068f-4cbe-9f76-a7939f14f901",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ee438ce74c66ffd1d9092c0870a8b79661e135b75fd707b2c17030b8a54a81ca"
+  },
+  "id": "BPE4NWKVBz6IXjCa",
+  "tags": []
+}
